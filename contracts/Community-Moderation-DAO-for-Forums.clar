@@ -375,6 +375,8 @@
 (define-constant ERR-POST-EXPIRED (err u109))
 (define-constant ERR-POST-ARCHIVED (err u110))
 (define-constant ERR-INVALID-DURATION (err u111))
+(define-constant ERR-CONTENT-HASH-MISMATCH (err u112))
+(define-constant ERR-VERIFICATION-ALREADY-EXISTS (err u113))
 
 (define-data-var default-post-lifetime uint u1008)
 (define-data-var archive-threshold uint u2016)
@@ -396,6 +398,28 @@
         action-type: (string-ascii 20),
         scheduled-for: uint,
         executed: bool,
+    }
+)
+
+(define-map content-integrity
+    { post-id: uint }
+    {
+        content-hash: (buff 32),
+        verifier: principal,
+        verified-at: uint,
+        integrity-status: (string-ascii 20),
+    }
+)
+
+(define-map verification-challenges
+    {
+        post-id: uint,
+        challenger: principal,
+    }
+    {
+        challenge-hash: (buff 32),
+        challenge-timestamp: uint,
+        resolution-status: (string-ascii 20),
     }
 )
 
@@ -547,5 +571,120 @@
 (define-read-only (get-posts-due-for-review)
     (let ((current-block burn-block-height))
         (ok current-block)
+    )
+)
+
+(define-public (verify-content-integrity
+        (post-id uint)
+        (content-hash (buff 32))
+    )
+    (let (
+            (post (unwrap! (map-get? posts { post-id: post-id }) ERR-POST-NOT-FOUND))
+            (existing-verification (map-get? content-integrity { post-id: post-id }))
+        )
+        (asserts! (is-none existing-verification) ERR-VERIFICATION-ALREADY-EXISTS)
+        (map-set content-integrity { post-id: post-id } {
+            content-hash: content-hash,
+            verifier: tx-sender,
+            verified-at: burn-block-height,
+            integrity-status: "verified",
+        })
+        (ok true)
+    )
+)
+
+(define-public (challenge-content-integrity
+        (post-id uint)
+        (challenge-hash (buff 32))
+    )
+    (let (
+            (post (unwrap! (map-get? posts { post-id: post-id }) ERR-POST-NOT-FOUND))
+            (integrity-record (unwrap! (map-get? content-integrity { post-id: post-id })
+                ERR-POST-NOT-FOUND
+            ))
+            (existing-challenge (map-get? verification-challenges {
+                post-id: post-id,
+                challenger: tx-sender,
+            }))
+        )
+        (asserts! (is-none existing-challenge) ERR-ALREADY-VOTED)
+        (asserts!
+            (not (is-eq (get content-hash integrity-record) challenge-hash))
+            ERR-CONTENT-HASH-MISMATCH
+        )
+        (map-set verification-challenges {
+            post-id: post-id,
+            challenger: tx-sender,
+        } {
+            challenge-hash: challenge-hash,
+            challenge-timestamp: burn-block-height,
+            resolution-status: "pending",
+        })
+        (map-set content-integrity { post-id: post-id }
+            (merge integrity-record { integrity-status: "challenged" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-integrity-challenge
+        (post-id uint)
+        (challenger principal)
+        (resolution (string-ascii 20))
+    )
+    (let (
+            (post (unwrap! (map-get? posts { post-id: post-id }) ERR-POST-NOT-FOUND))
+            (challenge (unwrap!
+                (map-get? verification-challenges {
+                    post-id: post-id,
+                    challenger: challenger,
+                })
+                ERR-POST-NOT-FOUND
+            ))
+            (integrity-record (unwrap! (map-get? content-integrity { post-id: post-id })
+                ERR-POST-NOT-FOUND
+            ))
+            (user-balance (default-to { balance: u0 }
+                (map-get? user-tokens { user: tx-sender })
+            ))
+        )
+        (asserts!
+            (>= (get balance user-balance) (var-get min-tokens-to-moderate))
+            ERR-INSUFFICIENT-TOKENS
+        )
+        (map-set verification-challenges {
+            post-id: post-id,
+            challenger: challenger,
+        }
+            (merge challenge { resolution-status: resolution })
+        )
+        (map-set content-integrity { post-id: post-id }
+            (merge integrity-record { integrity-status: (if (is-eq resolution "upheld")
+                "verified"
+                "disputed"
+            ) }
+            ))
+        (ok true)
+    )
+)
+
+(define-read-only (get-content-integrity (post-id uint))
+    (map-get? content-integrity { post-id: post-id })
+)
+
+(define-read-only (get-verification-challenge
+        (post-id uint)
+        (challenger principal)
+    )
+    (map-get? verification-challenges {
+        post-id: post-id,
+        challenger: challenger,
+    })
+)
+
+(define-read-only (is-content-verified (post-id uint))
+    (match (map-get? content-integrity { post-id: post-id })
+        integrity-record (is-eq (get integrity-status integrity-record) "verified")
+        false
     )
 )
