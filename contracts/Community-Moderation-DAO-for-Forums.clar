@@ -76,6 +76,7 @@
             voter: tx-sender,
         } { vote-type: "upvote" }
         )
+        (unwrap-panic (update-engagement-on-vote post-id))
         (ok true)
     )
 )
@@ -97,6 +98,7 @@
             voter: tx-sender,
         } { vote-type: "downvote" }
         )
+        (unwrap-panic (update-engagement-on-vote post-id))
         (ok true)
     )
 )
@@ -686,5 +688,258 @@
     (match (map-get? content-integrity { post-id: post-id })
         integrity-record (is-eq (get integrity-status integrity-record) "verified")
         false
+    )
+)
+
+(define-constant ERR-SCORE-CALCULATION-FAILED (err u114))
+(define-constant ERR-TRENDING-WINDOW-INVALID (err u115))
+
+(define-data-var engagement-decay-factor uint u95)
+(define-data-var trending-threshold uint u50)
+(define-data-var score-precision-multiplier uint u100)
+
+(define-map post-engagement-scores
+    { post-id: uint }
+    {
+        current-score: uint,
+        peak-score: uint,
+        last-updated: uint,
+        trending-status: bool,
+        interaction-count: uint,
+        score-velocity: uint,
+    }
+)
+
+(define-map engagement-metrics
+    { post-id: uint }
+    {
+        total-interactions: uint,
+        unique-interactors: uint,
+        quality-weighted-score: uint,
+        freshness-boost: uint,
+        controversy-score: uint,
+    }
+)
+
+(define-map score-snapshots
+    {
+        post-id: uint,
+        snapshot-height: uint,
+    }
+    {
+        score-at-snapshot: uint,
+        interactions-at-snapshot: uint,
+    }
+)
+
+(define-public (calculate-engagement-score (post-id uint))
+    (let (
+            (post (unwrap! (map-get? posts { post-id: post-id }) ERR-POST-NOT-FOUND))
+            (current-height burn-block-height)
+            (upvotes (get upvotes post))
+            (downvotes (get downvotes post))
+            (post-age (- current-height (get created-at post)))
+            (vote-ratio (if (> (+ upvotes downvotes) u0)
+                (/ (* upvotes (var-get score-precision-multiplier))
+                    (+ upvotes downvotes)
+                )
+                u50
+            ))
+            (freshness-factor (if (< post-age u144)
+                (- u100 (/ (* post-age u70) u144))
+                u30
+            ))
+            (interaction-score (+ upvotes downvotes))
+            (quality-bonus (if (> upvotes (* downvotes u2))
+                u20
+                u0
+            ))
+            (controversy-factor (if (and
+                    (> upvotes u0)
+                    (> downvotes u0)
+                    (< vote-ratio u80)
+                    (> vote-ratio u20)
+                )
+                u15
+                u0
+            ))
+            (base-score (+ (* vote-ratio u3) (* freshness-factor u2) (* interaction-score u5)
+                quality-bonus controversy-factor
+            ))
+            (time-decayed-score (/ (* base-score (var-get engagement-decay-factor)) u100))
+            (existing-score (default-to {
+                current-score: u0,
+                peak-score: u0,
+                last-updated: u0,
+                trending-status: false,
+                interaction-count: u0,
+                score-velocity: u0,
+            }
+                (map-get? post-engagement-scores { post-id: post-id })
+            ))
+            (velocity (if (> current-height (get last-updated existing-score))
+                (if (> time-decayed-score (get current-score existing-score))
+                    (- time-decayed-score (get current-score existing-score))
+                    u0
+                )
+                u0
+            ))
+            (is-trending (>= velocity (var-get trending-threshold)))
+        )
+        (map-set post-engagement-scores { post-id: post-id } {
+            current-score: time-decayed-score,
+            peak-score: (if (> time-decayed-score (get peak-score existing-score))
+                time-decayed-score
+                (get peak-score existing-score)
+            ),
+            last-updated: current-height,
+            trending-status: is-trending,
+            interaction-count: (+ upvotes downvotes),
+            score-velocity: velocity,
+        })
+        (map-set engagement-metrics { post-id: post-id } {
+            total-interactions: (+ upvotes downvotes),
+            unique-interactors: (+ upvotes downvotes),
+            quality-weighted-score: (/ (* vote-ratio base-score) u100),
+            freshness-boost: freshness-factor,
+            controversy-score: controversy-factor,
+        })
+        (ok time-decayed-score)
+    )
+)
+
+(define-public (batch-update-engagement-scores (post-ids (list 10 uint)))
+    (fold update-single-engagement-score post-ids (ok u0))
+)
+
+(define-private (update-single-engagement-score
+        (post-id uint)
+        (previous-result (response uint uint))
+    )
+    (match previous-result
+        success-value (calculate-engagement-score post-id)
+        error-value (err error-value)
+    )
+)
+
+(define-public (create-score-snapshot
+        (post-id uint)
+        (snapshot-height uint)
+    )
+    (let (
+            (engagement-score (unwrap! (map-get? post-engagement-scores { post-id: post-id })
+                ERR-POST-NOT-FOUND
+            ))
+            (metrics (unwrap! (map-get? engagement-metrics { post-id: post-id })
+                ERR-POST-NOT-FOUND
+            ))
+        )
+        (map-set score-snapshots {
+            post-id: post-id,
+            snapshot-height: snapshot-height,
+        } {
+            score-at-snapshot: (get current-score engagement-score),
+            interactions-at-snapshot: (get total-interactions metrics),
+        })
+        (ok true)
+    )
+)
+
+(define-public (boost-trending-post (post-id uint))
+    (let (
+            (engagement-score (unwrap! (map-get? post-engagement-scores { post-id: post-id })
+                ERR-POST-NOT-FOUND
+            ))
+            (user-balance (default-to { balance: u0 }
+                (map-get? user-tokens { user: tx-sender })
+            ))
+        )
+        (asserts! (get trending-status engagement-score) ERR-POST-NOT-FOUND)
+        (asserts! (>= (get balance user-balance) u5) ERR-INSUFFICIENT-TOKENS)
+        (map-set post-engagement-scores { post-id: post-id }
+            (merge engagement-score {
+                current-score: (+ (get current-score engagement-score) u25),
+                score-velocity: (+ (get score-velocity engagement-score) u10),
+            })
+        )
+        (let ((current-balance (get balance user-balance)))
+            (map-set user-tokens { user: tx-sender } { balance: (- current-balance u5) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-engagement-on-vote (post-id uint))
+    (calculate-engagement-score post-id)
+)
+
+(define-read-only (get-engagement-score (post-id uint))
+    (map-get? post-engagement-scores { post-id: post-id })
+)
+
+(define-read-only (get-engagement-metrics (post-id uint))
+    (map-get? engagement-metrics { post-id: post-id })
+)
+
+(define-read-only (get-score-snapshot
+        (post-id uint)
+        (snapshot-height uint)
+    )
+    (map-get? score-snapshots {
+        post-id: post-id,
+        snapshot-height: snapshot-height,
+    })
+)
+
+(define-read-only (is-post-trending (post-id uint))
+    (match (map-get? post-engagement-scores { post-id: post-id })
+        engagement-data (get trending-status engagement-data)
+        false
+    )
+)
+
+(define-read-only (get-trending-posts)
+    (let ((current-height burn-block-height))
+        (ok current-height)
+    )
+)
+
+(define-read-only (compare-engagement-scores
+        (post-id-a uint)
+        (post-id-b uint)
+    )
+    (let (
+            (score-a (default-to {
+                current-score: u0,
+                peak-score: u0,
+                last-updated: u0,
+                trending-status: false,
+                interaction-count: u0,
+                score-velocity: u0,
+            }
+                (map-get? post-engagement-scores { post-id: post-id-a })
+            ))
+            (score-b (default-to {
+                current-score: u0,
+                peak-score: u0,
+                last-updated: u0,
+                trending-status: false,
+                interaction-count: u0,
+                score-velocity: u0,
+            }
+                (map-get? post-engagement-scores { post-id: post-id-b })
+            ))
+        )
+        (if (> (get current-score score-a) (get current-score score-b))
+            post-id-a
+            post-id-b
+        )
+    )
+)
+
+(define-read-only (get-engagement-leaderboard-position (post-id uint))
+    (match (map-get? post-engagement-scores { post-id: post-id })
+        engagement-data (get current-score engagement-data)
+        u0
     )
 )
