@@ -943,3 +943,392 @@
         u0
     )
 )
+
+(define-constant ERR-APPEAL-NOT-FOUND (err u116))
+(define-constant ERR-APPEAL-ALREADY-EXISTS (err u117))
+(define-constant ERR-APPEAL-CLOSED (err u118))
+(define-constant ERR-ALREADY-VOTED-ON-APPEAL (err u119))
+(define-constant ERR-APPEAL-NOT-READY (err u120))
+(define-constant ERR-NO-MODERATION-TO-APPEAL (err u121))
+
+(define-data-var appeal-id-nonce uint u0)
+(define-data-var min-appeal-stake uint u50)
+(define-data-var appeal-voting-period uint u144)
+(define-data-var appeal-quorum-threshold uint u100)
+
+(define-map appeals
+    { appeal-id: uint }
+    {
+        post-id: uint,
+        moderator: principal,
+        appellant: principal,
+        reason: (string-ascii 280),
+        stake-amount: uint,
+        votes-for-overturn: uint,
+        votes-against-overturn: uint,
+        status: (string-ascii 20),
+        created-at: uint,
+        resolved-at: (optional uint),
+    }
+)
+
+(define-map appeal-votes
+    {
+        appeal-id: uint,
+        voter: principal,
+    }
+    {
+        vote-position: bool,
+        token-weight: uint,
+        voted-at: uint,
+    }
+)
+
+(define-map moderation-appeals-map
+    {
+        post-id: uint,
+        moderator: principal,
+    }
+    { appeal-id: uint }
+)
+
+(define-map user-appeal-stats
+    { user: principal }
+    {
+        appeals-filed: uint,
+        appeals-won: uint,
+        appeals-lost: uint,
+        total-stake-returned: uint,
+    }
+)
+
+(define-map appeal-outcomes
+    { appeal-id: uint }
+    {
+        outcome: (string-ascii 20),
+        final-vote-count: uint,
+        participation-rate: uint,
+        stake-returned: bool,
+    }
+)
+
+(define-public (create-appeal
+        (post-id uint)
+        (moderator principal)
+        (reason (string-ascii 280))
+    )
+    (let (
+            (moderation-action (unwrap!
+                (map-get? moderator-actions {
+                    post-id: post-id,
+                    moderator: moderator,
+                })
+                ERR-NO-MODERATION-TO-APPEAL
+            ))
+            (existing-appeal (map-get? moderation-appeals-map {
+                post-id: post-id,
+                moderator: moderator,
+            }))
+            (user-balance (default-to { balance: u0 }
+                (map-get? user-tokens { user: tx-sender })
+            ))
+            (appeal-id (var-get appeal-id-nonce))
+            (stake-amount (var-get min-appeal-stake))
+        )
+        (asserts! (is-none existing-appeal) ERR-APPEAL-ALREADY-EXISTS)
+        (asserts! (>= (get balance user-balance) stake-amount)
+            ERR-INSUFFICIENT-TOKENS
+        )
+        (map-set appeals { appeal-id: appeal-id } {
+            post-id: post-id,
+            moderator: moderator,
+            appellant: tx-sender,
+            reason: reason,
+            stake-amount: stake-amount,
+            votes-for-overturn: u0,
+            votes-against-overturn: u0,
+            status: "open",
+            created-at: burn-block-height,
+            resolved-at: none,
+        })
+        (map-set moderation-appeals-map {
+            post-id: post-id,
+            moderator: moderator,
+        } { appeal-id: appeal-id }
+        )
+        (map-set user-tokens { user: tx-sender } { balance: (- (get balance user-balance) stake-amount) })
+        (let ((user-stats (default-to {
+                appeals-filed: u0,
+                appeals-won: u0,
+                appeals-lost: u0,
+                total-stake-returned: u0,
+            }
+                (map-get? user-appeal-stats { user: tx-sender })
+            )))
+            (map-set user-appeal-stats { user: tx-sender } {
+                appeals-filed: (+ (get appeals-filed user-stats) u1),
+                appeals-won: (get appeals-won user-stats),
+                appeals-lost: (get appeals-lost user-stats),
+                total-stake-returned: (get total-stake-returned user-stats),
+            })
+        )
+        (var-set appeal-id-nonce (+ appeal-id u1))
+        (ok appeal-id)
+    )
+)
+
+(define-public (vote-on-appeal
+        (appeal-id uint)
+        (vote-for-overturn bool)
+    )
+    (let (
+            (appeal (unwrap! (map-get? appeals { appeal-id: appeal-id })
+                ERR-APPEAL-NOT-FOUND
+            ))
+            (existing-vote (map-get? appeal-votes {
+                appeal-id: appeal-id,
+                voter: tx-sender,
+            }))
+            (user-balance (default-to { balance: u0 }
+                (map-get? user-tokens { user: tx-sender })
+            ))
+            (token-weight (get balance user-balance))
+            (current-height burn-block-height)
+            (appeal-deadline (+ (get created-at appeal) (var-get appeal-voting-period)))
+        )
+        (asserts! (is-eq (get status appeal) "open") ERR-APPEAL-CLOSED)
+        (asserts! (< current-height appeal-deadline) ERR-APPEAL-CLOSED)
+        (asserts! (is-none existing-vote) ERR-ALREADY-VOTED-ON-APPEAL)
+        (asserts! (> token-weight u0) ERR-INSUFFICIENT-TOKENS)
+        (map-set appeal-votes {
+            appeal-id: appeal-id,
+            voter: tx-sender,
+        } {
+            vote-position: vote-for-overturn,
+            token-weight: token-weight,
+            voted-at: current-height,
+        })
+        (map-set appeals { appeal-id: appeal-id }
+            (merge appeal {
+                votes-for-overturn: (if vote-for-overturn
+                    (+ (get votes-for-overturn appeal) token-weight)
+                    (get votes-for-overturn appeal)
+                ),
+                votes-against-overturn: (if vote-for-overturn
+                    (get votes-against-overturn appeal)
+                    (+ (get votes-against-overturn appeal) token-weight)
+                ),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-appeal (appeal-id uint))
+    (let (
+            (appeal (unwrap! (map-get? appeals { appeal-id: appeal-id })
+                ERR-APPEAL-NOT-FOUND
+            ))
+            (current-height burn-block-height)
+            (appeal-deadline (+ (get created-at appeal) (var-get appeal-voting-period)))
+            (total-votes (+ (get votes-for-overturn appeal)
+                (get votes-against-overturn appeal)
+            ))
+            (overturn-wins (> (get votes-for-overturn appeal)
+                (get votes-against-overturn appeal)
+            ))
+            (quorum-met (>= total-votes (var-get appeal-quorum-threshold)))
+            (appellant (get appellant appeal))
+            (stake (get stake-amount appeal))
+        )
+        (asserts! (is-eq (get status appeal) "open") ERR-APPEAL-CLOSED)
+        (asserts! (>= current-height appeal-deadline) ERR-APPEAL-NOT-READY)
+        (let (
+                (final-status (if (and quorum-met overturn-wins)
+                    "upheld"
+                    "rejected"
+                ))
+                (return-stake (and quorum-met overturn-wins))
+            )
+            (map-set appeals { appeal-id: appeal-id }
+                (merge appeal {
+                    status: final-status,
+                    resolved-at: (some current-height),
+                })
+            )
+            (if return-stake
+                (begin
+                    (let ((appellant-balance (default-to { balance: u0 }
+                            (map-get? user-tokens { user: appellant })
+                        )))
+                        (map-set user-tokens { user: appellant } { balance: (+ (get balance appellant-balance) (+ stake u25)) })
+                    )
+                    (let ((user-stats (default-to {
+                            appeals-filed: u0,
+                            appeals-won: u0,
+                            appeals-lost: u0,
+                            total-stake-returned: u0,
+                        }
+                            (map-get? user-appeal-stats { user: appellant })
+                        )))
+                        (map-set user-appeal-stats { user: appellant } {
+                            appeals-filed: (get appeals-filed user-stats),
+                            appeals-won: (+ (get appeals-won user-stats) u1),
+                            appeals-lost: (get appeals-lost user-stats),
+                            total-stake-returned: (+ (get total-stake-returned user-stats) stake),
+                        })
+                    )
+                )
+                (let ((user-stats (default-to {
+                        appeals-filed: u0,
+                        appeals-won: u0,
+                        appeals-lost: u0,
+                        total-stake-returned: u0,
+                    }
+                        (map-get? user-appeal-stats { user: appellant })
+                    )))
+                    (map-set user-appeal-stats { user: appellant } {
+                        appeals-filed: (get appeals-filed user-stats),
+                        appeals-won: (get appeals-won user-stats),
+                        appeals-lost: (+ (get appeals-lost user-stats) u1),
+                        total-stake-returned: (get total-stake-returned user-stats),
+                    })
+                )
+            )
+            (map-set appeal-outcomes { appeal-id: appeal-id } {
+                outcome: final-status,
+                final-vote-count: total-votes,
+                participation-rate: (if (> total-votes u0)
+                    (let ((threshold (var-get appeal-quorum-threshold)))
+                        (/ (* total-votes u100)
+                            (if (> total-votes threshold)
+                                total-votes
+                                threshold
+                            ))
+                    )
+                    u0
+                ),
+                stake-returned: return-stake,
+            })
+            (if (and quorum-met overturn-wins)
+                (let ((post (unwrap! (map-get? posts { post-id: (get post-id appeal) })
+                        ERR-POST-NOT-FOUND
+                    )))
+                    (map-set posts { post-id: (get post-id appeal) }
+                        (merge post { status: "active" })
+                    )
+                )
+                true
+            )
+            (ok return-stake)
+        )
+    )
+)
+
+(define-public (cancel-appeal (appeal-id uint))
+    (let (
+            (appeal (unwrap! (map-get? appeals { appeal-id: appeal-id })
+                ERR-APPEAL-NOT-FOUND
+            ))
+            (appellant (get appellant appeal))
+            (stake (get stake-amount appeal))
+        )
+        (asserts! (is-eq tx-sender appellant) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status appeal) "open") ERR-APPEAL-CLOSED)
+        (let ((total-votes (+ (get votes-for-overturn appeal)
+                (get votes-against-overturn appeal)
+            )))
+            (asserts! (is-eq total-votes u0) ERR-ALREADY-VOTED)
+            (map-set appeals { appeal-id: appeal-id }
+                (merge appeal {
+                    status: "cancelled",
+                    resolved-at: (some burn-block-height),
+                })
+            )
+            (let ((appellant-balance (default-to { balance: u0 }
+                    (map-get? user-tokens { user: appellant })
+                )))
+                (map-set user-tokens { user: appellant } { balance: (+ (get balance appellant-balance) stake) })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-appeal (appeal-id uint))
+    (map-get? appeals { appeal-id: appeal-id })
+)
+
+(define-read-only (get-appeal-vote
+        (appeal-id uint)
+        (voter principal)
+    )
+    (map-get? appeal-votes {
+        appeal-id: appeal-id,
+        voter: voter,
+    })
+)
+
+(define-read-only (get-appeal-for-moderation
+        (post-id uint)
+        (moderator principal)
+    )
+    (map-get? moderation-appeals-map {
+        post-id: post-id,
+        moderator: moderator,
+    })
+)
+
+(define-read-only (get-user-appeal-stats (user principal))
+    (default-to {
+        appeals-filed: u0,
+        appeals-won: u0,
+        appeals-lost: u0,
+        total-stake-returned: u0,
+    }
+        (map-get? user-appeal-stats { user: user })
+    )
+)
+
+(define-read-only (get-appeal-outcome (appeal-id uint))
+    (map-get? appeal-outcomes { appeal-id: appeal-id })
+)
+
+(define-read-only (is-appeal-active (appeal-id uint))
+    (match (map-get? appeals { appeal-id: appeal-id })
+        appeal-data (and
+            (is-eq (get status appeal-data) "open")
+            (< burn-block-height
+                (+ (get created-at appeal-data) (var-get appeal-voting-period))
+            )
+        )
+        false
+    )
+)
+
+(define-read-only (get-appeal-voting-power (user principal))
+    (get balance
+        (default-to { balance: u0 } (map-get? user-tokens { user: user }))
+    )
+)
+
+(define-read-only (calculate-appeal-result (appeal-id uint))
+    (match (map-get? appeals { appeal-id: appeal-id })
+        appeal-data (let (
+                (total-votes (+ (get votes-for-overturn appeal-data)
+                    (get votes-against-overturn appeal-data)
+                ))
+                (overturn-percentage (if (> total-votes u0)
+                    (/ (* (get votes-for-overturn appeal-data) u100) total-votes)
+                    u0
+                ))
+            )
+            (ok {
+                total-votes: total-votes,
+                overturn-percentage: overturn-percentage,
+                quorum-met: (>= total-votes (var-get appeal-quorum-threshold)),
+            })
+        )
+        ERR-APPEAL-NOT-FOUND
+    )
+)
