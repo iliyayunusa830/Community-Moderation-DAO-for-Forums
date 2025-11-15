@@ -904,6 +904,17 @@
     )
 )
 
+(define-read-only (get-post-summary (post-id uint))
+    (ok {
+        post: (map-get? posts { post-id: post-id }),
+        lifecycle: (map-get? post-lifecycle { post-id: post-id }),
+        engagement-score: (map-get? post-engagement-scores { post-id: post-id }),
+        engagement-metrics: (map-get? engagement-metrics { post-id: post-id }),
+        content-integrity: (map-get? content-integrity { post-id: post-id }),
+        scheduled-action: (map-get? scheduled-actions { post-id: post-id }),
+    })
+)
+
 (define-read-only (compare-engagement-scores
         (post-id-a uint)
         (post-id-b uint)
